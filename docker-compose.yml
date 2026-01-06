@@ -1,0 +1,108 @@
+
+services:
+  # WordPress for content publishing
+  wordpress:
+    image: wordpress:6.4-apache
+    container_name: readallaboutit-wordpress
+    restart: unless-stopped
+    ports:
+      - "${WP_PORT:-8080}:80"
+    environment:
+      WORDPRESS_DB_HOST: wordpress-db
+      WORDPRESS_DB_USER: ${WP_DB_USER:-wordpress}
+      WORDPRESS_DB_PASSWORD: ${WP_DB_PASSWORD:-wordpress}
+      WORDPRESS_DB_NAME: ${WP_DB_NAME:-wordpress}
+    volumes:
+      - wordpress_data:/var/www/html
+    depends_on:
+      - wordpress-db
+    networks:
+      - readallaboutit
+
+  # MariaDB for WordPress
+  wordpress-db:
+    image: mariadb:10.11
+    container_name: readallaboutit-wordpress-db
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${WP_DB_NAME:-wordpress}
+      MYSQL_USER: ${WP_DB_USER:-wordpress}
+      MYSQL_PASSWORD: ${WP_DB_PASSWORD:-wordpress}
+      MYSQL_ROOT_PASSWORD: ${WP_DB_ROOT_PASSWORD:-rootpassword}
+    volumes:
+      - wordpress_db_data:/var/lib/mysql
+    networks:
+      - readallaboutit
+
+  # PostgreSQL for Engine
+  postgres:
+    image: postgres:15-alpine
+    container_name: readallaboutit-postgres
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-engine}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-engine}
+      POSTGRES_DB: ${POSTGRES_DB:-readallaboutit}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - readallaboutit
+
+  # Engine service (Node.js/TypeScript)
+  engine:
+    build:
+      context: ./apps/engine
+      dockerfile: Dockerfile
+    container_name: readallaboutit-engine
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      DATABASE_URL: postgres://${POSTGRES_USER:-engine}:${POSTGRES_PASSWORD:-engine}@postgres:5432/${POSTGRES_DB:-readallaboutit}
+      # AI Provider selection
+      AI_PROVIDER: ${AI_PROVIDER:-openai}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-1.5-flash}
+      # WordPress
+      WP_URL: ${WP_URL:-http://wordpress}
+      WP_USERNAME: ${WP_USERNAME}
+      WP_APP_PASSWORD: ${WP_APP_PASSWORD}
+      PUBLISH_MODE: ${PUBLISH_MODE:-draft}
+      DAILY_PUBLISH_LIMIT: ${DAILY_PUBLISH_LIMIT:-10}
+      SAFE_TOPICS_ONLY: ${SAFE_TOPICS_ONLY:-true}
+      CRON_SCHEDULE: ${CRON_SCHEDULE:-0 */4 * * *}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    # volumes removed for production - uncomment for dev with hot reload
+    # volumes:
+    #   - ./apps/engine:/app
+    #   - /app/node_modules
+    depends_on:
+      - postgres
+      - wordpress
+    networks:
+      - readallaboutit
+
+  # Adminer for database inspection (optional)
+  adminer:
+    image: adminer:4
+    container_name: readallaboutit-adminer
+    restart: unless-stopped
+    ports:
+      - "${ADMINER_PORT:-8081}:8080"
+    networks:
+      - readallaboutit
+    profiles:
+      - tools
+
+networks:
+  readallaboutit:
+    driver: bridge
+
+volumes:
+  wordpress_data:
+  wordpress_db_data:
+  postgres_data:
