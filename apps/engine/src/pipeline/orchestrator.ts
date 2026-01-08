@@ -2,6 +2,7 @@
  * Pipeline Orchestrator
  * 
  * Coordinates the full content pipeline from discovery to publishing.
+ * Now integrates with Strategy Engine for trend-based topic discovery.
  */
 
 import { v4 as uuid } from 'uuid';
@@ -16,6 +17,10 @@ import { generateArticle } from './generate';
 import { runQualityGate } from './qualityGate';
 import { publishArticle, checkPublishLimit } from './publish';
 import { runRefreshLoop } from './refresh';
+import { runTrustChecks, TRUST_CONFIG, checkPublishingCooldown } from './trustRebuild';
+
+// Strategy Engine integration
+import { runStrategyCycle, getNextTopic, ContentPlan } from '../strategy';
 
 const logger = createLogger('orchestrator');
 
@@ -193,6 +198,30 @@ async function runGeneration(): Promise<number> {
 
                 logger.info('Processing query', { query: scoredQuery.query });
 
+                // TRUST REBUILD: Run trust checks before generation
+                if (TRUST_CONFIG.enabled) {
+                    const trustResult = await runTrustChecks(
+                        scoredQuery.query,
+                        scoredQuery.topicCategory || 'General Reference'
+                    );
+
+                    if (!trustResult.allowed) {
+                        logger.warn('Trust checks failed, skipping', {
+                            query: scoredQuery.query,
+                            reasons: trustResult.reasons
+                        });
+
+                        // Mark as rejected in DB
+                        await query(
+                            `UPDATE queries SET status = 'rejected', review_notes = $1 WHERE id = $2`,
+                            [trustResult.reasons.join('; '), scoredQuery.id]
+                        );
+
+                        failed++;
+                        continue;
+                    }
+                }
+
                 // Generate outline
                 const outline = await generateOutline(scoredQuery);
                 if (!validateOutline(outline)) {
@@ -224,8 +253,23 @@ async function runGeneration(): Promise<number> {
 
                 succeeded++;
 
-                // Small delay between publications
-                await new Promise(resolve => setTimeout(resolve, 3000));
+                // TRUST REBUILD: Extended delay between publications
+                const delayMs = TRUST_CONFIG.enabled
+                    ? TRUST_CONFIG.minHoursBetweenPublishes * 60 * 60 * 1000 / 4 // 1 hour between publishes in trust mode
+                    : 3000;
+
+                if (delayMs > 10000) {
+                    logger.info('Trust Rebuild: Pausing transmission to mimic human rhythm', {
+                        delayMinutes: Math.round(delayMs / 60000),
+                        nextActionAt: new Date(Date.now() + delayMs).toISOString()
+                    });
+                }
+
+                await new Promise(resolve => setTimeout(resolve, delayMs));
+
+                if (delayMs > 10000) {
+                    logger.info('Resuming after trust delay');
+                }
             } catch (error) {
                 logger.error('Failed to process query', {
                     query: scoredQuery.query,
@@ -254,13 +298,93 @@ async function runGeneration(): Promise<number> {
 }
 
 /**
- * Run the full pipeline
+ * Run strategy-driven discovery
+ * Fetches trending topics and news, adds them as keywords for discovery
+ */
+async function runStrategyDiscovery(): Promise<number> {
+    const jobId = await createJob('strategy');
+    logger.info('Starting strategy discovery', { jobId });
+
+    try {
+        // Run the strategy cycle to get prioritized topics
+        const plans = await runStrategyCycle({
+            enableTrends: true,
+            enableNews: true,
+            maxPlansPerCycle: 10,
+        });
+
+        let added = 0;
+
+        for (const plan of plans) {
+            // Check if keyword already exists
+            const existing = await query(
+                `SELECT id FROM keywords WHERE keyword = $1`,
+                [plan.keyword]
+            );
+
+            if (existing.rows.length === 0) {
+                // Add as new keyword
+                await query(
+                    `INSERT INTO keywords (keyword, category, priority, is_active)
+                     VALUES ($1, $2, $3, true)`,
+                    [plan.keyword, plan.source, plan.priority]
+                );
+                added++;
+
+                logger.info('Added trending keyword', { keyword: plan.keyword, priority: plan.priority });
+            }
+
+            // Save to content_plans table
+            await query(
+                `INSERT INTO content_plans (keyword, priority, source, time_urgency, related_topics, notes, status)
+                 VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+                 ON CONFLICT DO NOTHING`,
+                [
+                    plan.keyword,
+                    plan.priority,
+                    plan.source,
+                    plan.timeUrgency || 'evergreen',
+                    JSON.stringify(plan.relatedTopics || []),
+                    plan.notes || null
+                ]
+            );
+        }
+
+        await updateJob(jobId, {
+            status: 'completed',
+            itemsProcessed: plans.length,
+            itemsSucceeded: added,
+        });
+
+        logger.info('Strategy discovery completed', { plans: plans.length, newKeywords: added });
+        return added;
+    } catch (error) {
+        logger.warn('Strategy discovery failed, falling back to standard discovery', {
+            error: error instanceof Error ? error.message : 'Unknown error',
+        });
+        await updateJob(jobId, {
+            status: 'failed',
+            errorMessage: error instanceof Error ? error.message : 'Unknown error',
+        });
+        return 0;
+    }
+}
+
+/**
+ * Run the full pipeline with Strategy Engine integration
  */
 export async function runPipeline(): Promise<void> {
     logger.info('Starting pipeline run');
 
     try {
-        // Phase 1: Discovery
+        // Phase 0: Strategy Discovery (trend-driven topics)
+        try {
+            await runStrategyDiscovery();
+        } catch (strategyError) {
+            logger.warn('Strategy phase skipped', { error: strategyError });
+        }
+
+        // Phase 1: Standard Discovery (keyword-based)
         await runDiscovery();
 
         // Phase 2: Generation & Publishing
@@ -294,4 +418,11 @@ export async function runGenerationOnly(): Promise<number> {
     return runGeneration();
 }
 
-export default { runPipeline, runDiscoveryOnly, runGenerationOnly };
+/**
+ * Run strategy discovery only
+ */
+export async function runStrategyOnly(): Promise<number> {
+    return runStrategyDiscovery();
+}
+
+export default { runPipeline, runDiscoveryOnly, runGenerationOnly, runStrategyOnly };
